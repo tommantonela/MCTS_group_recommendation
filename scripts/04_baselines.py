@@ -6,6 +6,7 @@ import scipy as sp
 import os
 import pickle
 from datetime import datetime
+import json
 
 def get_training_recommend_group(structure,train_user_only=5,test_user_only=5,nliked_user_only=5):
     
@@ -36,6 +37,8 @@ def get_training_recommend_group(structure,train_user_only=5,test_user_only=5,nl
 
 
 def train_predict(df_ratings_final,users_training,to_recommend,group_mappings,all_users=True,restrict_training=True):
+    
+    print('----------------',len(to_recommend))
     
     if all_users:         
         set__ = set(df_ratings_final['userId'].values).difference(group_mapping.keys()) 
@@ -83,82 +86,26 @@ def train_predict(df_ratings_final,users_training,to_recommend,group_mappings,al
     model = implicit.als.AlternatingLeastSquares(factors=200,num_threads=1)
     model.fit(user_items)
 
-    recs_users = {}
+    recs_users_filtered = {}
+    recs_users_all = {}
     for u in tqdm(users_training):
         i = index_users[u]
-        recs = model.recommend(i,user_items[i:i+1,:],N=len(index_items), filter_already_liked_items=True)
-        recs_users[abs(u)] = {inverted_index_items[recs[0][j]] : recs[1][j] for j in range(0,len(recs[0])) if inverted_index_items[recs[0][j]] in to_recommend}
-    
-    return recs_users
-
-dir_path = './'
-
-min_ratings_movie = 25
-min_ratings_user = 30
-min_date = '2016-01-01'
-
-df_movies = pd.read_csv(dir_path + 'ml-25m/movies.csv')
-df_movies
-
-df_ratings = pd.read_csv(dir_path + 'ml-25m/ratings.csv')
-df_ratings
-
-df_ratings_min_date = df_ratings[df_ratings['timestamp'] >= datetime.strptime('2016-01-01', '%Y-%m-%d').timestamp()]
-df_ratings_min_date
-
-df_items_ratings = df_ratings_min_date.groupby(['movieId'])[['rating']].count().sort_values(by="rating", ascending=False)
-df_items_ratings = df_items_ratings[df_items_ratings['rating'] > min_ratings_movie]
-df_items_ratings
-
-df_users_ratings = df_ratings_min_date[df_ratings_min_date['movieId'].isin(set(df_items_ratings.index))].groupby('userId')[['rating']].count().sort_values('rating',ascending=False)
-df_users_ratings = df_users_ratings[df_users_ratings['rating'] > min_ratings_user]
-df_users_ratings
-
-df_ratings_final = df_ratings_min_date[df_ratings_min_date['userId'].isin(set(df_users_ratings.index))]
-
-value_combinations = []
-value_combinations.append({'train_user_only':5,'test_user_only':5,'nliked_user_only':5,'name': 'restricted_training'})
-value_combinations.append({'train_user_only':-1,'test_user_only':-1,'nliked_user_only':-1, 'name': 'full_training'})
-
-for file in os.listdir(dir_path):
-    
-    if not file.startswith('group'):
-        continue
-    
-    if 'queries' in file:
-        continue
-    
-    if '__gs' not in file:
-        continue
-    
-    print(file)
-    structure = pd.read_pickle(dir_path + file)
-    
-    for x in value_combinations:
+        recs = model.recommend(i,user_items[i],N=len(index_items),filter_already_liked_items=True)
+        recs_users_all[abs(u)] = {inverted_index_items[recs[0][j]] : recs[1][j] for j in range(0,len(recs[0]))}        
+        recs_users_filtered[abs(u)] = {k:v for k,v in recs_users_all[abs(u)].items() if k in to_recommend}
         
-        recs_name = 'recommendations_implicit_' + x['name'] 
-        
-        if os.path.exists(dir_path + recs_name + f'_all_users__{file}') and os.path.exists(dir_path + recs_name + f'_group_users__{file}'):
-            continue
-        
-        print('Obtaining training information...')
-        users_training, to_recommend, group_mapping = get_training_recommend_group(structure,train_user_only=x['train_user_only'],test_user_only=x['train_user_only'],nliked_user_only=x['train_user_only'])
-        
-        if not os.path.exists(dir_path + recs_name + f'_all_users__{file}'):
-            recs = train_predict(df_ratings_final,users_training,to_recommend,group_mapping,all_users=True)
-            with open(dir_path + recs_name + f'_all_users__{file}','wb') as ff:
-                pickle.dump(recs,ff)
-             
-        if not os.path.exists(dir_path + recs_name + f'_group_users__{file}'):
-            recs = train_predict(df_ratings_final,users_training,to_recommend,group_mapping,all_users=False)
-            with open(dir_path + recs_name + f'_group_users__{file}','wb') as ff:
-                pickle.dump(recs,ff)
+        ll = [(k,v) for k,v in recs_users_all[abs(u)].items()]
+        ll.sort(key=lambda tup: tup[1],reverse=True)
+        recs_users_all[abs(u)] = {x[0]:x[1] for x in ll[0:min(len(ll),len(to_recommend)*5)]}
 
-# ----------------------------------------------------------
+        recs_users_all[abs(u)].update(recs_users_filtered[abs(u)])
+        
+    return recs_users_all,recs_users_filtered
+
 
 def get_training_recommend_group_whole(structure,train_user_only=5,test_user_only=5,nliked_user_only=5):
     
-
+    # con users_training tengo que editar ratings
     users_training = {} # union of all possible trainings for that user
     to_recommend = set() # union of all possible to recommend sets
     
@@ -186,31 +133,136 @@ def get_training_recommend_group_whole(structure,train_user_only=5,test_user_onl
     return users_training, to_recommend, group_mapping 
 
 
+def post_process_meta(recs): # a dict with a dict of {movie:id, score}
+    print('Postprocessing...')
+    final_recs = []
+    
+    for i in range(0,len(recs)):
+        aggregation = [(k,v) for k,v in recs[i].items()]
+        aggregation.sort(key=lambda tup: tup[1],reverse=True)
+                
+        final_recs.append([(('',''),json.dumps({'movies':[df_movies_titles[x[0]] for x in aggregation]}))]) 
+    
+    return final_recs
+
+
+dir_path = './'
+
+implicit_path = dir_path + 'implicit/'
+
+min_ratings_movie = 25
+min_ratings_user = 30
+min_date = '2016-01-01'
+
+df_movies = pd.read_csv(dir_path + 'ml-25m/movies.csv')
+df_movies
+
+df_movies_titles = {df_movies['movieId'].values[i] : df_movies['title'].values[i] for i in range(0,len(df_movies))}
+
+df_ratings = pd.read_csv(dir_path + 'ml-25m/ratings.csv')
+df_ratings
+
+df_ratings_min_date = df_ratings[df_ratings['timestamp'] >= datetime.strptime('2016-01-01', '%Y-%m-%d').timestamp()]
+df_ratings_min_date
+
+df_items_ratings = df_ratings_min_date.groupby(['movieId'])[['rating']].count().sort_values(by="rating", ascending=False)
+df_items_ratings = df_items_ratings[df_items_ratings['rating'] > min_ratings_movie]
+df_items_ratings
+
+df_users_ratings = df_ratings_min_date[df_ratings_min_date['movieId'].isin(set(df_items_ratings.index))].groupby('userId')[['rating']].count().sort_values('rating',ascending=False)
+df_users_ratings = df_users_ratings[df_users_ratings['rating'] > min_ratings_user]
+df_users_ratings
+
+df_ratings_final = df_ratings_min_date[df_ratings_min_date['userId'].isin(set(df_users_ratings.index))]
+
+value_combinations = []
+value_combinations.append({'train_user_only':5,'test_user_only':5,'nliked_user_only':5,'name': 'restricted_training'})
+value_combinations.append({'train_user_only':-1,'test_user_only':-1,'nliked_user_only':-1, 'name': 'full_training'})
+
 for file in os.listdir(dir_path):
     
     if not file.startswith('group'):
         continue
     
-    if 'queries' in file:
-        continue
-    
-    if '__gs' not in file:
-        continue
-    
     print(file)
     structure = pd.read_pickle(dir_path + file)
     
-    for x in value_combinations:
+    for x in value_combinations: 
         
-        recs_name = 'recommendations_implicit_metagroup_' + x['name']
+        recs_name = 'recommendations_implicit_' + x['name'] 
         
-        if os.path.exists(dir_path + recs_name + '.pickle'):
-            continue
+        file_condition_all_user = not os.path.exists(implicit_path + recs_name + f'_all_users__{file}') or os.path.exists(implicit_path + recs_name + f'_all_users_all__{file}')
+        file_condition_group_users = not os.path.exists(implicit_path + recs_name + f'_group_users__{file}') or not os.path.exists(implicit_path + recs_name + f'_group_users_all__{file}')
+                               
+        if file_condition_all_user or file_condition_group_users:
+            print(implicit_path + recs_name + f'_all_users__{file}')
+            
+            print('Obtaining training information...')
+            users_training, to_recommend, group_mapping = get_training_recommend_group(structure,train_user_only=x['train_user_only'],test_user_only=x['train_user_only'],nliked_user_only=x['train_user_only'])
+            
+            if file_condition_all_user:
+                recs_all, recs_filtered = train_predict(df_ratings_final,users_training,to_recommend,group_mapping,all_users=True)
+                if not os.path.exists(implicit_path + recs_name + f'_all_users__{file}'):
+                    with open(implicit_path + recs_name + f'_all_users__{file}','wb') as ff:
+                        pickle.dump(recs_filtered,ff)
+            
+                if not os.path.exists(implicit_path + recs_name + f'_all_users_all__{file}'):
+                    with open(implicit_path + recs_name + f'_all_users_all__{file}','wb') as ff:
+                        pickle.dump(recs_all,ff)
+                 
+            if file_condition_group_users:
+                recs_all, recs_filtered = train_predict(df_ratings_final,users_training,to_recommend,group_mapping,all_users=False)
+                if not os.path.exists(implicit_path + recs_name + f'_group_users__{file}'):
+                    with open(implicit_path + recs_name + f'_group_users__{file}','wb') as ff:
+                        pickle.dump(recs_filtered,ff)
+                        
+                if not os.path.exists(implicit_path + recs_name + f'_group_users_all__{file}'):
+                    with open(implicit_path + recs_name + f'_group_users_all__{file}','wb') as ff:
+                        pickle.dump(recs_all,ff)
+
+        recs_name = 'recommendations_implicit_mg_' + x['name'] 
         
-        print('Obtaining training information...')
-        users_training, to_recommend,group_mapping = get_training_recommend_group_whole(structure,train_user_only=x['train_user_only'],test_user_only=x['train_user_only'],nliked_user_only=x['train_user_only'])
+        file_condition_all_user = not os.path.exists(implicit_path + recs_name + f'_all_users__{file}') or os.path.exists(implicit_path + recs_name + f'_all_users_all__{file}')
         
-        if not os.path.exists(dir_path + recs_name + '.pickle'):        
-            recs = train_predict(df_ratings_final,users_training,to_recommend,group_mapping,all_users=True)
-            with open(dir_path + recs_name + '.pickle','wb') as ff:
-                pickle.dump(recs,ff)
+        file_condition_group_users = not os.path.exists(implicit_path + recs_name + f'_group_users__{file}') or not os.path.exists(implicit_path + recs_name + f'_group_users_all__{file}')
+        
+        if file_condition_all_user or file_condition_group_users:
+            
+            print(recs_name)
+            
+            print('Obtaining training information...')
+            users_training, to_recommend, group_mapping = get_training_recommend_group_whole(structure,train_user_only=x['train_user_only'],test_user_only=x['train_user_only'],nliked_user_only=x['train_user_only'])
+            
+            if file_condition_all_user:
+            
+                recs_all, recs_filtered = train_predict(df_ratings_final,users_training,to_recommend,group_mapping,all_users=True)
+            
+                if not os.path.exists(implicit_path + recs_name + f'_all_users__{file}'):
+                    with open(implicit_path + recs_name + f'_all_users__{file}','wb') as ff:
+                        pickle.dump(recs_filtered,ff)
+
+                if not os.path.exists(implicit_path + recs_name + f'_all_users_all__{file}'):
+                    with open(implicit_path + recs_name + f'_all_users_all__{file}','wb') as ff:
+                        pickle.dump(recs_all,ff)
+                
+                recs_filtered = post_process_meta(recs_all)
+                with open(implicit_path + recs_name.replace('recommendations_','results__') + f'_all_users__{file}','wb') as ff:
+                    pickle.dump(recs_filtered,ff)
+                
+            if file_condition_group_users:
+            
+                recs_all, recs_filtered = train_predict(df_ratings_final,users_training,to_recommend,group_mapping,all_users=False)
+            
+                if not os.path.exists(implicit_path + recs_name + f'_group_users__{file}'):
+                    with open(implicit_path + recs_name + f'_group_users__{file}','wb') as ff:
+                        pickle.dump(recs_filtered,ff)
+
+                if not os.path.exists(implicit_path + recs_name + f'_group_users_all__{file}'):
+                    with open(implicit_path + recs_name + f'_group_users_all__{file}','wb') as ff:
+                        pickle.dump(recs_all,ff)
+
+                recs_filtered = post_process_meta(recs_all)
+                with open(implicit_path + recs_name.replace('recommendations_','results__') + f'_group_users__{file}','wb') as ff:
+                    pickle.dump(recs_filtered,ff)
+
+print('Done!', str(datetime.now()))
